@@ -14,6 +14,30 @@ import urllib
 import time
 import voyageai
 from concurrent.futures import ThreadPoolExecutor
+import requests
+import numpy as np
+
+LLAMA_CPP_EMBEDDING_URL = "http://localhost:11436/embedding"   # 与 [2] 保持一致
+
+def get_llama_cpp_embeddings(texts, model="/root/Qwen3/Qwen3-Embedding-0.6B-Q8_0.gguf"):
+    """批量调用 llama.cpp embedding 接口，返回 List[np.ndarray]"""
+    if not texts:
+        return []
+    try:
+        resp = requests.post(
+            LLAMA_CPP_EMBEDDING_URL,
+            json={"model": model, "content": list(texts)},
+            headers={"Content-Type": "application/json"},
+            timeout=120
+        )
+        resp.raise_for_status()
+        return [np.array(item["embedding"], dtype=np.float32) for item in resp.json()]
+    except Exception as e:
+        print("llama.cpp embedding error:", e)
+        # fallback：返回与输入等长的零向量
+        return [np.zeros(1024, dtype=np.float32) for _ in texts]
+
+
 executor = ThreadPoolExecutor(max_workers=8)
 
 db = VectorDB()
@@ -30,9 +54,15 @@ voyage_client = voyageai.Client(
     timeout=120,
 )
 
-openai_client = AsyncOpenAI(
-    api_key=settings["OPENAI_API_KEY"],
+# 创建本地llama.cpp客户端
+llamacpp_client = AsyncOpenAI(
+    base_url="http://localhost:11435/v1",
+    api_key="sk-no-key-required"  # llama.cpp通常不需要API密钥
 )
+
+# openai_client = AsyncOpenAI(
+#     api_key=settings["OPENAI_API_KEY"],
+# )
 
 together_client = AsyncTogether(
     api_key=settings['TOGETHER_API_KEY'],
@@ -52,7 +82,7 @@ async def querier_i18n(locale, statement, *template_choices):
 
         prompt = prompt.replace("[[ORIGINAL]]", ORIGINAL).strip()
         
-        if "gemma" in engine.lower():
+        if False and "gemma" in engine.lower():
             response = await together_client.chat.completions.create(
                 messages=[
                     {"role": "user", "content": prompt},
@@ -61,13 +91,26 @@ async def querier_i18n(locale, statement, *template_choices):
                 model="google/gemma-2-27b-it",
             )
             return response.choices[0].message.content.strip()
-        elif "gpt" in engine.lower():
-            response = await openai_client.chat.completions.create(
+        elif False and "gpt" in engine.lower():
+            # response = await openai_client.chat.completions.create(
+            #     messages=[
+            #         {"role": "system", "content": "You are a helpful assistant."},
+            #         {"role": "user", "content": prompt},
+            #     ],
+            #     model="gpt-4o-mini"
+            # )
+            return response.choices[0].message.content.strip().replace(prefix.strip(), '', 1).strip()
+        elif True or "llama" in engine.lower() or "local" in engine.lower():
+            # 使用本地llama.cpp模型
+            response = await llamacpp_client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": "You are a helpful assistant that simplifies programming problem statements."},
+                    {"role": "user", "content": prompt + ' /no_think'},
                 ],
-                model="gpt-4o-mini"
+                model="/root/Qwen3/Qwen3-0.6B-Q8_0.gguf",
+                temperature=0.1,
+                top_p=0.9,
+                max_tokens=4096
             )
             return response.choices[0].message.content.strip().replace(prefix.strip(), '', 1).strip()
         else:
@@ -78,20 +121,43 @@ async def querier_i18n(locale, statement, *template_choices):
     yields = await asyncio.gather(*tasks)
 
     t2 = time.time()
-    print('query llm', t2-t1)
-    response = voyage_client.embed(
-        list(set(y.strip() for y in yields if len(y))),
-        model="voyage-large-2-instruct",
-        input_type='query'
-    )
-    print('Token spent',response.total_tokens)
-    emb = [d for d in response.embeddings]
+    unique_texts = list(set(y.strip() for y in yields if len(y)))
+    print(f"Generated {len(unique_texts)} unique texts: {unique_texts}")
+    
+    embs = get_llama_cpp_embeddings(unique_texts)
+    print(f"Generated {len(embs)} embeddings")
+    
+    # 检查嵌入向量维度
+    if embs and len(embs) > 0:
+        print(f"Embedding dimension: {len(embs[0])}")
+    
+    print('Token spent (llama.cpp), texts:', len(unique_texts))
     t3 = time.time()
     print('query emb', t3-t2)
 
     loop = asyncio.get_running_loop()
-    nearest = await loop.run_in_executor(executor, db.query_nearest, emb, 5000)
-#    nearest = db.query_nearest(emb, k=5000)
+    if embs:
+        # 使用所有嵌入向量进行查询，取最大相似度
+        all_nearest = []
+        for emb in embs:
+            nearest = await loop.run_in_executor(executor, db.query_nearest, emb, 100)  # 获取更多结果
+            all_nearest.extend(nearest)
+            print(f"Found {len(nearest)} results for one embedding")
+        
+        # 合并所有结果并取每个问题的最大相似度
+        results_by_key = {}
+        for sim, idx in all_nearest:
+            key = (db.metadata[idx][0], db.metadata[idx][1])  # 使用文件名和源作为唯一标识
+            if key not in results_by_key or sim > results_by_key[key][0]:
+                results_by_key[key] = (sim, idx)
+        
+        # 按相似度排序并取前50个
+        nearest = sorted(results_by_key.values(), key=lambda x: x[0], reverse=True)[:50]
+        print(f"After deduplication, found {len(nearest)} unique results")
+    else:
+        nearest = []
+        print("No embeddings generated")
+    
     t4 = time.time()
     print('query nearest', t4-t3)
 
@@ -100,7 +166,8 @@ async def querier_i18n(locale, statement, *template_choices):
 
     info = 'Fetched top ' + str(len(sim)) + ' matches! Go to the next tab to view results~' if locale == 'en' else \
            '已查找到前' + str(len(sim)) + '个匹配！进入下一页查看结果~'
-
+    print('【1】raw nearest 50:', len(nearest))
+    print('【2】sim 数组长度:', sim.shape if sim.size else 0)
     return [info, (sim, ids)] + yields
 
 
@@ -109,6 +176,13 @@ def format_problem_i18n(locale, uid, sim):
         if locale == 'en': return en
         if locale == 'zh': return zh
         raise NotImplementedError(locale)
+    
+    # Convert sim to scalar if it's a numpy array
+    if hasattr(sim, 'item'):
+        sim_scalar = sim.item()
+    else:
+        sim_scalar = sim
+    
     # be careful about arbitrary reads
     uid = db.metadata[int(uid)][0]
     problem = read_problem(uid)
@@ -140,7 +214,7 @@ def format_problem_i18n(locale, uid, sim):
     assert problemlink.endswith('.json')
     problemlink = problemlink[:-5].strip()
     # markdown = f"# [{title} ({problemlink})]({url})\n\n"
-    html = f'<p><span style="font-size:22px; font-weight: 500;">{title}</span>&nbsp;&nbsp;<span style="font-size:15px">{problemlink} ({round(sim*100)}%)</span></p>\n'
+    html = f'<p><span style="font-size:22px; font-weight: 500;">{title}</span>&nbsp;&nbsp;<span style="font-size:15px">{problemlink} ({round(sim_scalar*100)}%)</span></p>\n'
     link0 = 'https://www.google.com/search?'+urllib.parse.urlencode({'q': problemlink})
     link1 = 'https://www.google.com/search?'+urllib.parse.urlencode({'q': problem['source']+' '+title})
     link0_bd = 'https://www.baidu.com/s?'+urllib.parse.urlencode({'wd': problemlink})
@@ -208,19 +282,13 @@ def get_block(locale):
                         with gr.Accordion(tr("Template ",'版本 ')+str(template_id+1)):
                             with gr.Row():
                                 with gr.Group():
-                                    template = settings['TEMPLATES'][(template_id-1)%2] if template_id in [1,2] else None
-                                    # engines = [tr("Keep Original",'保留原描述'), "Gemma 2 (27B)", "GPT4o Mini", tr('None', '跳过该版本')]
-                                    # engine = gr.Radio(
-                                    #     engines,
-                                    #     label=tr("Engine",'使用的语言模型'),
-                                    #     value=engines[-1] if template is None else engines[1] if template_id<=2 else engines[2],
-                                    #     interactive=True,
-                                    # )
-                                    engines = [tr("Keep Original",'保留原描述'), "GPT4o Mini", tr('None', '跳过该版本')]
+                                    template = settings['TEMPLATES'][(template_id-1)%2] if template_id in [1] else None
+                                    # 添加本地LLM选项
+                                    engines = [tr("Keep Original",'保留原描述'), "GPT4o Mini", "Local LLM (Qwen3)", tr('None', '跳过该版本')]
                                     engine = gr.Radio(
                                         engines,
                                         label=tr("Engine",'使用的语言模型'),
-                                        value=engines[-1] if template is None else engines[1],# if template_id<=2 else engines[2],
+                                        value=engines[-1] if template is None else engines[2],  # 默认使用本地LLM
                                         interactive=True,
                                     )
                                     prompt = gr.TextArea(
@@ -235,8 +303,8 @@ def get_block(locale):
                                         interactive=True,
                                         visible=template is not None,
                                     )
-                                    # hide these when engine has wrong value
-                                    engine.change(lambda engine: (gr.update(visible=any(s in engine.lower() for s in ['gpt','gemma'])),)*2, engine, [prompt, prefix])
+                                    # 修改可见性条件，包含本地LLM
+                                    engine.change(lambda engine: (gr.update(visible=any(s in engine.lower() for s in ['gpt','local','llama'])),)*2, engine, prompt, prefix)
                                 output_text = gr.TextArea(
                                     label=tr('Output','重写结果'),
                                     value="",
@@ -248,7 +316,7 @@ def get_block(locale):
                 status_text = gr.Markdown("", elem_classes="centermarkdown")
             with gr.TabItem(tr("View Results",'查看结果'),id=1):
                 cur_idx = gr.State(0)
-                num_columns = gr.State(1)
+                num_columns = gr.State(50)
                 ojs = [f'{t} ({c})' for t,c in sorted(db.sources.items())]
                 oj_dropdown = gr.Dropdown(
                     ojs, value=ojs, multiselect=True, label=tr("Displayed OJs",'展示的OJ'),
@@ -287,36 +355,42 @@ def get_block(locale):
                 @gr.render(inputs=[search_result, oj_dropdown, cur_idx, num_columns, statement_min_len], concurrency_limit=None)
                 def show_OJs(search_result, oj_dropdown, cur_idx, num_columns, statement_min_len):
                     allowed_OJs = set([oj[:oj.find(' (')] for oj in oj_dropdown])
-                    tot = 0
-                    # print(len(search_result[0]),len(search_result[1]))
+                    filtered_results = []
+                    
+                    # 过滤结果
                     for sim, idx in zip(search_result[0], search_result[1]):
                         if db.metadata[idx][1] not in allowed_OJs or db.metadata[idx][2] < statement_min_len:
                             continue
-                        tot += 1
-                    gr.Markdown(tr(f"Page {round(cur_idx/num_columns)+1} of {(tot+num_columns-1)//num_columns} ({num_columns} per page)",
-                                   f'第 {round(cur_idx/num_columns)+1} 页 / 共 {(tot+num_columns-1)//num_columns} 页 (每页显示 {num_columns} 个)'),
+                        filtered_results.append((sim, idx))
+                    
+                    tot = len(filtered_results)
+                    total_pages = (tot + num_columns - 1) // num_columns if tot > 0 else 1
+                    current_page = (cur_idx // num_columns) + 1 if tot > 0 else 1
+                    
+                    gr.Markdown(tr(f"Page {current_page} of {total_pages} ({num_columns} per page, total {tot} results)",
+                                   f'第 {current_page} 页 / 共 {total_pages} 页 (每页显示 {num_columns} 个，共 {tot} 个结果)'),
                                    elem_classes="pagedisp")
-                    cnt = 0
+                    
+                    # 显示当前页的结果
+                    start_idx = cur_idx
+                    end_idx = min(cur_idx + num_columns, tot)
+                    
                     with gr.Row():
-                        for sim, idx in zip(search_result[0], search_result[1]):
-                            if db.metadata[idx][1] not in allowed_OJs or db.metadata[idx][2] < statement_min_len:
-                                continue
-                            cnt += 1
-                            if cur_idx+1 <= cnt:
-                                if cnt > cur_idx+num_columns: break
-                                with gr.Column(variant='compact'):
-                                    html, md = format_problem_i18n(locale, idx, sim)
-                                    gr.HTML(html)
-                                    gr.Markdown(
-                                        latex_delimiters=[
-                                            {"left": "$$", "right": "$$", "display": True},
-                                            {"left": "$", "right": "$", "display": False},
-                                            {"left": "\\(", "right": "\\)", "display": False},
-                                            {"left": "\\[", "right": "\\]", "display": True},
-                                        ],
-                                        value=md,
-                                        elem_classes="mymarkdown",
-                                    )
+                        for i in range(start_idx, end_idx):
+                            sim, idx = filtered_results[i]
+                            with gr.Column(variant='compact'):
+                                html, md = format_problem_i18n(locale, idx, sim)
+                                gr.HTML(html)
+                                gr.Markdown(
+                                    latex_delimiters=[
+                                        {"left": "$$", "right": "$$", "display": True},
+                                        {"left": "$", "right": "$", "display": False},
+                                        {"left": "\\(", "right": "\\)", "display": False},
+                                        {"left": "\\[", "right": "\\]", "display": True},
+                                    ],
+                                    value=md,
+                                    elem_classes="mymarkdown",
+                                )
             if 'CUSTOM_ABOUT_PY' in settings and settings['CUSTOM_ABOUT_PY'].endswith('.py'):
                 with gr.TabItem(tr("About",'关于'),id=2):
                     with open(settings['CUSTOM_ABOUT_PY'], 'r', encoding='utf-8') as f: eval(f.read())
@@ -377,4 +451,4 @@ app = gr.mount_gradio_app(app, get_block('zh'), path="/zh")
 app = gr.mount_gradio_app(app, get_block('en'), path="/en")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=80)
+    uvicorn.run(app, host="0.0.0.0", port=8090)

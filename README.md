@@ -1,5 +1,5 @@
 # Is my problem new?
-A simple semantic search engine on competitive programming problems.
+A simple semantic search engine on competitive programming problems using llama.cpp.
 <a href="http://yuantiji.ac" target="_blank" style="color: blue">http://yuantiji.ac</a> | <a href="https://www.buymeacoffee.com/fjzzq2002" target="_blank" style="color: brown">Buy me a boba</a>
 
 <img src="logo.gif" style="zoom:50%;" />
@@ -22,12 +22,30 @@ This pipeline is also not limited, of course, to competitive programming problem
 
 #### Deploy
 
-You will need API keys from OpenAI, Together and Voyage. You can check their pricings online.
+You need a computer with more than 6GB RAM or vRAM.
 
-Put problems in `problems/` folder following the given example (`problems/1000.json`). Naming could be arbitrary and you could also have nested folders. Run `python -m src.build_summary` to get paraphrased statements, run `python -m src.build_embedding` to build embeddings and run `python -m src.build_locale` to detect language of problems. Finally, run `python -m src.ui` to start serving.
+First, install [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
+
+You will need 2 llama.cpp servers, Qwen3-0.6B and Qwen3-Embedding-0.6B. You can download them online.
+
+You need to run these commands to run the servers.
+```bash
+./build/bin/llama-server -m ./Qwen3-0.6B-Q8_0.gguf --ctx-size 8192 --port 11435
+./build/bin/llama-server -m ./Qwen3-Embedding-0.6B-Q8_0.gguf --port 11436 --embedding --pooling last -ub 8192 --verbose-prompt
+```
+
+Then, you should replace the server URLs and model names in `src/build_summary.py`, `src/embedding.py` and `src/ui.py`.
+
+Put problems in `problems/` folder following the given example (`problems/1000.json`). Naming could be arbitrary and you could also have nested folders. Run `python -m src.build_summary` to get paraphrased statements, run `python -m src.embedder` to build embeddings and run `python -m src.build_locale` to detect language of problems. Finally, run `python -m src.ui` to start serving.
 
 For large-scale running decent CPUs are needed as doing vector searching is CPU-dense. You might also want to modify `max_workers` in `src/ui.py`.
 
-Due to copyright concerns we're not providing scrapped vjudge problems and vjudge scrapper. Sorry D: We also did not process the statements in PDF. If you have problems you want to add that are not supported in vjudge feel free to contact me or send PR and I'll see what I can do (would be perfect if you can just send over a zip in the correct format xd).
+For reference, adding all ~34k problems from [luogu](https://www.luogu.com.cn/) cost ~$0.1 and as of writing the deployed site is running on a 8vCPU server.
 
-For reference, adding all ~160k problems from vjudge cost ~$60 and as of writing the deployed site is running on a 8vCPU server.
+---
+
+### Note: 
+
+You can get the problems from [LuoguCrawler](https://github.com/tommyjink/LuoguCrawler).
+
+You can format the problem with `src/collect.py`.
