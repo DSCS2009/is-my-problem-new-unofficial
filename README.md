@@ -20,7 +20,11 @@ It only happens recently that both models are good and cheap enough.
 
 This pipeline is also not limited, of course, to competitive programming problems. You can use it to search for any kind of documents by modifying the prompt.
 
-#### Deploy
+#### Deploy: Method 1
+
+`sudo docker run --name my_container -p 8888:8090 -d dscs2009/is-my-problem-new:latest`
+
+#### Deploy: Method 2
 
 You need a computer with more than 6GB RAM or vRAM.
 
